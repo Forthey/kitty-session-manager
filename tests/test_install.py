@@ -106,3 +106,14 @@ class CancellationTests(InstallerTests):
         with mock.patch('builtins.input', return_value='n'):
             self.assertEqual(install.main([]), 2)
         self.assertEqual(list(self.home.iterdir()), [])
+
+class UnitSafetyTests(InstallationFlowTests):
+    def test_existing_unit_symlink_is_never_overwritten(self):
+        unit = self.home / 'config/systemd/user/kitty-savesession.timer'
+        unit.parent.mkdir(parents=True)
+        target = self.home / 'my-timer'
+        target.write_text('# managed by kitty-session-manager\nuser content')
+        unit.symlink_to(target)
+        with mock.patch('install.subprocess.run', side_effect=self.fake_command):
+            self.assertEqual(install.main(['--yes']), 1)
+        self.assertEqual(target.read_text(), '# managed by kitty-session-manager\nuser content')

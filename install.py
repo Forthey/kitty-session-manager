@@ -126,7 +126,7 @@ def install(yes):
     timer = unitdir / 'kitty-savesession.timer'
     # Existing unit files must be owned by this installer.
     for unit in (service, timer):
-        if unit.exists() and '# managed by kitty-session-manager' not in unit.read_text():
+        if unit.is_symlink() or (unit.exists() and (not unit.is_file() or '# managed by kitty-session-manager' not in unit.read_text())):
             raise RuntimeError(f'Конфликт с существующим unit: {unit}')
     systemd_enabled = systemctl('is-enabled', 'kitty-savesession.timer', check=False).returncode == 0
     systemd_active = systemctl('is-active', 'kitty-savesession.timer', check=False).returncode == 0
