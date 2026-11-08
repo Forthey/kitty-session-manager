@@ -64,7 +64,7 @@ def main(argv=None):
         return 0
     if not args.yes and input('Установить или обновить kitty-session-manager? [y/N] ').strip().lower() not in ('y', 'yes', 'д', 'да'):
         print('Отменено')
-        return 0
+        return 2
     try:
         return install(args.yes)
     except (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError, tomllib.TOMLDecodeError) as exc:

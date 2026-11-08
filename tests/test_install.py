@@ -100,3 +100,9 @@ class RollbackTests(InstallationFlowTests):
             self.assertEqual(install.main(['--yes']), 1)
         self.assertEqual(command.resolve(), old_target)
         self.assertEqual(timer.read_bytes(), old_timer)
+
+class CancellationTests(InstallerTests):
+    def test_cancel_reports_distinct_status(self):
+        with mock.patch('builtins.input', return_value='n'):
+            self.assertEqual(install.main([]), 2)
+        self.assertEqual(list(self.home.iterdir()), [])
