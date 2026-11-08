@@ -1,0 +1,15 @@
+[kitty]
+executable = ""
+socket_path = "/tmp/mykitty-{pid}"
+
+[autosave]
+enabled = true
+interval_seconds = 30
+
+[save]
+max_processes = 2
+min_tabs = 2
+min_os_windows = 1
+
+[storage]
+max_sessions = 10

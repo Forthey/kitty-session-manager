@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+"""Восстановить одну из последних сессий kitty (интерактивный выбор).
+
+    loadsession            # выбрать в меню -> открыть в НОВОМ OS-окне
+    loadsession -a/--add   # добавить табы сессии в текущее окно
+    loadsession -r/--replace  # заменить табы текущего окна на сессию
+    loadsession --pick N   # без меню: N-я сессия (0 = самая свежая)
+
+Меню на rich со стрелками ↑/↓ (j/k), Enter — выбрать, q/Esc — отмена.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as _dt
+import os
+import select
+import subprocess
+import sys
+import termios
+import time
+import tty
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ksession  # noqa: E402
+
+HOME = Path.home()
+
+
+# --------------------------------------------------------------------------- #
+# Формат
+# --------------------------------------------------------------------------- #
+def _humanize(epoch: float) -> str:
+    d = max(0, int(time.time() - epoch))
+    if d < 45:
+        return "только что"
+    if d < 3600:
+        return f"{d // 60} мин назад"
+    if d < 86400:
+        return f"{d // 3600} ч назад"
+    return f"{d // 86400} дн назад"
+
+
+def _when(session: dict) -> str:
+    epoch = session.get("saved_at_epoch") or session.get("_mtime", 0)
+    try:
+        stamp = _dt.datetime.fromtimestamp(epoch).strftime("%d.%m %H:%M")
+    except (OverflowError, OSError, ValueError):
+        stamp = "?"
+    return f"{stamp}  ({_humanize(epoch)})"
+
+
+def _tabword(n: int) -> str:
+    if 11 <= n % 100 <= 14:
+        return "табов"
+    return {1: "таб", 2: "таба", 3: "таба", 4: "таба"}.get(n % 10, "табов")
+
+
+# --------------------------------------------------------------------------- #
+# Интерактивный выбор (rich + termios)
+# --------------------------------------------------------------------------- #
+def _read_key(fd: int) -> bytes:
+    ch = os.read(fd, 1)
+    if ch == b"\x1b":  # начало escape-последовательности?
+        r, _, _ = select.select([fd], [], [], 0.05)
+        if r:
+            ch += os.read(fd, 2)
+    return ch
+
+
+def _render(sessions: list[dict], idx: int):
+    from rich.console import Group
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+
+    table = Table(expand=True, box=None, pad_edge=False)
+    table.add_column(" ", width=2, no_wrap=True)
+    table.add_column("когда", no_wrap=True)
+    table.add_column("табов", justify="right", no_wrap=True)
+    table.add_column("табы", ratio=1)
+    for i, s in enumerate(sessions):
+        n = ksession.session_tab_count(s)
+        titles = ", ".join(ksession.session_tab_titles(s))
+        if len(titles) > 60:
+            titles = titles[:59] + "…"
+        selected = i == idx
+        cursor = "▶" if selected else " "
+        style = "bold reverse" if selected else ""
+        table.add_row(cursor, _when(s), f"{n}", titles, style=style)
+
+    cur = sessions[idx]
+    lines = Text()
+    for j, (_, tab) in enumerate(ksession.iter_tabs(cur), 1):
+        w0 = tab.get("windows") or [{}]
+        cwd = w0[0].get("cwd", "") or ""
+        cwd = cwd.replace(str(HOME), "~")
+        title = tab.get("title") or "(без имени)"
+        lines.append(f" {j:>2}. ", style="dim")
+        lines.append(title, style="bold cyan")
+        lines.append(f"  {cwd}\n", style="dim")
+    preview = Panel(lines, title="[dim]содержимое сессии[/]",
+                    border_style="dim", padding=(0, 1))
+
+    header = Panel(
+        table,
+        title="[bold]Сессии kitty[/]",
+        subtitle="[dim]↑/↓ выбрать · Enter открыть · q отмена[/]",
+        border_style="cyan", padding=(0, 1),
+    )
+    return Group(header, preview)
+
+
+def pick_interactive(sessions: list[dict]) -> dict | None:
+    from rich.live import Live
+
+    idx = 0
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        with Live(_render(sessions, idx), screen=True, auto_refresh=False) as live:
+            while True:
+                live.update(_render(sessions, idx), refresh=True)
+                key = _read_key(fd)
+                if key in (b"\x1b[A", b"k"):
+                    idx = (idx - 1) % len(sessions)
+                elif key in (b"\x1b[B", b"j"):
+                    idx = (idx + 1) % len(sessions)
+                elif key in (b"\r", b"\n"):
+                    return sessions[idx]
+                elif key in (b"q", b"\x1b", b"\x03"):
+                    return None
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def pick_numbered(sessions: list[dict]) -> dict | None:
+    """Fallback без tty: нумерованный список + ввод номера."""
+    for i, s in enumerate(sessions):
+        titles = ", ".join(ksession.session_tab_titles(s))
+        print(f"  [{i}] {_when(s)}  {ksession.session_tab_count(s)} "
+              f"{_tabword(ksession.session_tab_count(s))}  — {titles}")
+    try:
+        raw = input("номер сессии (Enter — отмена): ").strip()
+    except EOFError:
+        return None
+    if not raw.isdigit() or not (0 <= int(raw) < len(sessions)):
+        return None
+    return sessions[int(raw)]
+
+
+# --------------------------------------------------------------------------- #
+# Восстановление через kitty @
+# --------------------------------------------------------------------------- #
+def _sock() -> str:
+    pid = os.environ.get("KITTY_PID")
+    if not pid:
+        _die("loadsession нужно запускать внутри kitty ($KITTY_PID не задан).")
+    sock = ksession.socket_for_pid(pid)
+    if not Path(sock).exists():
+        _die(f"нет сокета {sock}. Проверь 'listen_on unix:/tmp/mykitty' и перезапусти kitty.")
+    return sock
+
+
+def _self_wid() -> int:
+    wid = os.environ.get("KITTY_WINDOW_ID")
+    if not wid:
+        _die("режимы --add/--replace нужно запускать внутри kitty ($KITTY_WINDOW_ID нет).")
+    return int(wid)
+
+
+def _kitty(sock: str, *args: str) -> str:
+    res = subprocess.run(
+        [ksession.kitty_bin(), "@", "--to", f"unix:{sock}", *args],
+        capture_output=True, text=True, timeout=15,
+    )
+    if res.returncode != 0:
+        raise RuntimeError(f"kitty @ {' '.join(args)} -> {res.stderr.strip()}")
+    return res.stdout.strip()
+
+
+def _launch(sock: str, ltype: str, cwd: str, title: str,
+            match: str | None = None) -> int:
+    args = ["launch", f"--type={ltype}", "--cwd", cwd or str(HOME)]
+    if title:
+        args += ["--tab-title", title, "--title", title]
+    if match:
+        args += ["--match", match]
+    return int(_kitty(sock, *args))
+
+
+def _restore_tab(sock, tab, ltype, anchor, created):
+    windows = tab.get("windows") or [{}]
+    match = f"window_id:{anchor}" if anchor is not None else None
+    wid = _launch(sock, ltype, windows[0].get("cwd", ""), tab.get("title", ""), match)
+    created.append(wid)
+    if tab.get("layout"):
+        try:
+            _kitty(sock, "goto-layout", "--match", f"window_id:{wid}", tab["layout"])
+        except RuntimeError:
+            pass
+    for window in windows[1:]:
+        _launch(sock, "window", window.get("cwd", ""), "", f"window_id:{wid}")
+    return wid
+
+
+def _rollback(sock, created, original):
+    failures = []
+    for wid in reversed(created):
+        try:
+            _kitty(sock, "close-tab", "--match", f"window_id:{wid}")
+        except Exception as exc:
+            try:
+                live = ksession.run_ls(sock)
+                present = any(w.get("id") == wid for ow in live for tab in ow.get("tabs", []) for w in tab.get("windows", []))
+            except Exception:
+                present = True
+            if present:
+                failures.append(f"{wid}: {exc}")
+    result = f"откат неполный: {', '.join(failures)}" if failures else "откат выполнен"
+    raise RuntimeError(f"{original}. {result}") from original
+
+
+def _restore(sock, session, anchor, new_windows):
+    created = []
+    focus = None
+    try:
+        for ow in session.get("os_windows", []):
+            if new_windows:
+                anchor = None
+            for tab in ow.get("tabs", []):
+                typ = "os-window" if new_windows and anchor is None else "tab"
+                wid = _restore_tab(sock, tab, typ, anchor, created)
+                anchor = wid
+                if tab.get("is_active"):
+                    focus = wid
+        if focus is not None:
+            _kitty(sock, "focus-window", "--match", f"window_id:{focus}")
+        return created
+    except Exception as exc:
+        _rollback(sock, created, exc)
+
+
+def restore_new_window(sock, session):
+    _restore(sock, session, None, True)
+
+
+def restore_add(sock, session, anchor0, do_focus=True):
+    return _restore(sock, session, anchor0, False)
+
+
+def restore_replace(sock, session, self_wid):
+    old_tab_ids = []
+    self_tab = None
+    for ow in ksession.run_ls(sock):
+        if not any(w.get("id") == self_wid for tab in ow.get("tabs", []) for w in tab.get("windows", [])):
+            continue
+        for tab in ow.get("tabs", []):
+            if any(w.get("id") == self_wid for w in tab.get("windows", [])):
+                self_tab = tab.get("id")
+            else:
+                old_tab_ids.append(tab.get("id"))
+        break
+    if self_tab is None:
+        raise RuntimeError("Не найдена текущая вкладка")
+    created = restore_add(sock, session, self_wid)
+    if not created:
+        raise RuntimeError("Не создано ни одной вкладки, прежние сохранены")
+    closed = []
+    for tid in old_tab_ids:
+        try:
+            _kitty(sock, "close-tab", "--match", f"id:{tid}")
+            closed.append(tid)
+        except Exception as exc:
+            raise RuntimeError(f"Частичное закрытие. Закрыты: {closed}. Остались: {[x for x in old_tab_ids if x not in closed] + [self_tab]}. Новые вкладки сохранены. {exc}") from exc
+    try:
+        _kitty(sock, "close-tab", "--match", f"id:{self_tab}")
+    except Exception as exc:
+        raise RuntimeError(f"Частичное закрытие. Закрыты: {closed}. Осталась вкладка {self_tab}. Новые вкладки сохранены. {exc}") from exc
+
+
+# --------------------------------------------------------------------------- #
+# main
+# --------------------------------------------------------------------------- #
+def _die(msg: str) -> None:
+    try:
+        from rich.console import Console
+        Console(stderr=True).print(f"[bold red]✗[/] {msg}")
+    except Exception:
+        print(f"loadsession: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _ok(msg: str) -> None:
+    try:
+        from rich.console import Console
+        Console().print(msg)
+    except Exception:
+        print(msg)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Восстановить сессию kitty.")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("-a", "--add", action="store_true",
+                       help="добавить табы сессии в текущее окно")
+    group.add_argument("-r", "--replace", action="store_true",
+                       help="заменить табы текущего окна на сессию")
+    parser.add_argument("--pick", type=int, metavar="N",
+                        help="без меню: N-я сессия (0 — самая свежая)")
+    args = parser.parse_args()
+
+    config = ksession.load_config()
+    ksession.configure(config)
+    if config["save"]["max_processes"] > config["storage"]["max_sessions"]:
+        print("Предупреждение: save.max_processes больше storage.max_sessions", file=sys.stderr)
+    sessions = ksession.load_sessions()
+    if not sessions:
+        _die(f"нет сохранённых сессий в {ksession.storage_dir()}")
+
+    if args.pick is not None:
+        if not (0 <= args.pick < len(sessions)):
+            _die(f"индекс вне диапазона 0..{len(sessions) - 1}")
+        chosen = sessions[args.pick]
+    elif sys.stdin.isatty() and sys.stdout.isatty():
+        chosen = pick_interactive(sessions)
+    else:
+        chosen = pick_numbered(sessions)
+
+    if chosen is None:
+        _ok("[dim]отменено[/]")
+        return 0
+
+    sock = _sock()
+    n = ksession.session_tab_count(chosen)
+    if args.add:
+        restore_add(sock, chosen, _self_wid())
+        _ok(f"[green]✔[/] добавлено [bold]{n}[/] {_tabword(n)} в текущее окно")
+    elif args.replace:
+        restore_replace(sock, chosen, _self_wid())
+        # сюда можем не дойти: свой таб закрыт
+    else:
+        restore_new_window(sock, chosen)
+        _ok(f"[green]✔[/] сессия открыта в новом окне ([bold]{n}[/] {_tabword(n)})")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as exc:
+        _die(str(exc))
