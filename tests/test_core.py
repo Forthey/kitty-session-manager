@@ -63,6 +63,33 @@ class RestoreTests(unittest.TestCase):
                 module.restore_new_window('socket', session)
             self.assertTrue(any('close-tab' in call.args for call in kitty.call_args_list))
 
+    def _load(self):
+        import importlib.machinery, importlib.util
+        loader = importlib.machinery.SourceFileLoader('loadsession_test', 'loadsession')
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        return module
+
+    def test_focus_uses_window_id_match(self):
+        module = self._load()
+        session = {'os_windows': [{'tabs': [{'windows': [{}], 'is_active': True}]}]}
+        with patch.object(module, '_launch', return_value=38), patch.object(module, '_kitty') as kitty:
+            module.restore_new_window('socket', session)
+        focus = [c.args for c in kitty.call_args_list if 'focus-window' in c.args]
+        self.assertEqual(focus, [('socket', 'focus-window', '--match', 'id:38')])
+
+    def test_focus_failure_keeps_restored_tabs(self):
+        module = self._load()
+        session = {'os_windows': [{'tabs': [{'windows': [{}], 'is_active': True}]}]}
+        def kitty(sock, *args):
+            if 'focus-window' in args:
+                raise RuntimeError('focus failed')
+            return ''
+        with patch.object(module, '_launch', return_value=38), patch.object(module, '_kitty', side_effect=kitty) as k:
+            self.assertEqual(module.restore_add('socket', session, 1), [38])
+        self.assertFalse(any('close-tab' in c.args for c in k.call_args_list))
+
 class IntegrationTests(unittest.TestCase):
     def test_all_rejects_over_limit_before_changing_snapshots(self):
         import subprocess, sys

@@ -236,7 +236,12 @@ def _restore(sock, session, anchor, new_windows):
                 if tab.get("is_active"):
                     focus = wid
         if focus is not None:
-            _kitty(sock, "focus-window", "--match", f"window_id:{focus}")
+            # focus-window принимает селектор окна, а не вкладки, поэтому поле id.
+            # Сбой фокуса не повод откатывать уже восстановленную сессию.
+            try:
+                _kitty(sock, "focus-window", "--match", f"id:{focus}")
+            except RuntimeError:
+                pass
         return created
     except Exception as exc:
         _rollback(sock, created, exc)
